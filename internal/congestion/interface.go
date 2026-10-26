@@ -3,6 +3,7 @@ package congestion
 import (
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/utils"
 )
 
 // A SendAlgorithm performs congestion control
@@ -25,3 +26,7 @@ type SendAlgorithmWithDebugInfos interface {
 	InRecovery() bool
 	GetCongestionWindow() protocol.ByteCount
 }
+
+// A Maker builds a send algorithm for a connection from its RTT stats and
+// current datagram size.
+type Maker func(*utils.RTTStats, protocol.ByteCount) SendAlgorithmWithDebugInfos

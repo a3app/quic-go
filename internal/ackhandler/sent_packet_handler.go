@@ -90,8 +90,12 @@ type sentPacketHandler struct {
 	bytesInFlight protocol.ByteCount
 
 	congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
-	connStats  *utils.ConnectionStats
+	// newCongestion replaces Reno when set (SetCongestionControl), also
+	// after a path migration. mss is the datagram size it starts with.
+	newCongestion congestion.Maker
+	mss           protocol.ByteCount
+	rttStats      *utils.RTTStats
+	connStats     *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -148,6 +152,7 @@ func NewSentPacketHandler(
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     congestion,
+		mss:                            initialMaxDatagramSize,
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
 		qlogger:                        qlogger,
@@ -1028,7 +1033,16 @@ func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
 }
 
 func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
+	h.mss = s
 	h.congestion.SetMaxDatagramSize(s)
+}
+
+// SetCongestionControl swaps the congestion controller for one made by m.
+// Packets in flight stay counted; the new controller learns from the next
+// ones it sends.
+func (h *sentPacketHandler) SetCongestionControl(m congestion.Maker) {
+	h.newCongestion = m
+	h.congestion = m(h.rttStats, h.mss)
 }
 
 func (h *sentPacketHandler) isAmplificationLimited() bool {
@@ -1131,13 +1145,18 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
-	h.congestion = congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		h.rttStats,
-		h.connStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		h.qlogger,
-	)
+	h.mss = initialMaxDatagramSize
+	if h.newCongestion != nil {
+		h.congestion = h.newCongestion(h.rttStats, initialMaxDatagramSize)
+	} else {
+		h.congestion = congestion.NewCubicSender(
+			congestion.DefaultClock{},
+			h.rttStats,
+			h.connStats,
+			initialMaxDatagramSize,
+			true, // use Reno
+			h.qlogger,
+		)
+	}
 	h.setLossDetectionTimer(now)
 }

@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go/congestion"
 	"github.com/quic-go/quic-go/internal/ackhandler"
+	icongestion "github.com/quic-go/quic-go/internal/congestion"
 	"github.com/quic-go/quic-go/internal/flowcontrol"
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -153,6 +155,7 @@ type Conn struct {
 
 	cryptoStreamManager   *cryptoStreamManager
 	sentPacketHandler     ackhandler.SentPacketHandler
+	nextCongestion        atomic.Pointer[congestion.Algorithm] // applied by the run loop
 	receivedPacketHandler ackhandler.ReceivedPacketHandler
 	retransmissionQueue   *retransmissionQueue
 	framer                *framer
@@ -673,6 +676,12 @@ runLoop:
 			}
 		}
 
+		if a := c.nextCongestion.Swap(nil); a != nil {
+			if h, ok := c.sentPacketHandler.(interface{ SetCongestionControl(icongestion.Maker) }); ok {
+				h.SetCongestionControl(a.Maker())
+			}
+		}
+
 		// Check for loss detection timeout.
 		// This could cause packets to be declared lost, and retransmissions to be enqueued.
 		now := monotime.Now()
@@ -762,6 +771,14 @@ func (c *Conn) earlyConnReady() <-chan struct{} {
 
 // Context returns a context that is cancelled when the connection is closed.
 // The cancellation cause is set to the error that caused the connection to close.
+// SetCongestionControl replaces the congestion controller of this
+// connection. It takes effect on the connection's next loop and is safe to
+// call from any goroutine.
+func (c *Conn) SetCongestionControl(a congestion.Algorithm) {
+	c.nextCongestion.Store(&a)
+	c.scheduleSending()
+}
+
 func (c *Conn) Context() context.Context {
 	return c.ctx
 }
