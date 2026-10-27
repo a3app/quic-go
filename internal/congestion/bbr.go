@@ -201,6 +201,8 @@ func (b *bbrSender) OnPacketAcked(pn protocol.PacketNumber, _, _ protocol.ByteCo
 			b.cycle = (b.cycle + 1) % len(bbrCycle)
 			b.cycleStamp, b.pacingGain = now, bbrCycle[b.cycle]
 		}
+	case bbrProbeRTT:
+		// Left below, once the probe has held for long enough.
 	}
 	if stale && b.mode != bbrProbeRTT {
 		b.mode, b.pacingGain, b.probeEnd = bbrProbeRTT, 1, 0
