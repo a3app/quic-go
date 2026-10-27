@@ -15,7 +15,9 @@ import (
 //
 // Bandwidth comes from delivery-rate samples: for each acked packet, bytes
 // delivered since it was sent over the time that took. The estimate is the
-// largest sample of the last ten round trips. Min RTT is the smallest RTT of
+// largest sample of the last ten round trips in which the path, not the
+// app, set the pace: a quiet spell (the peer uploading, a page being read)
+// keeps the old estimate instead of letting it shrink to the trickle. Min RTT is the smallest RTT of
 // the last ten seconds; when it goes stale the sender drains to four packets
 // for 200 ms (ProbeRTT) to measure it again.
 
@@ -64,7 +66,8 @@ type bbrSender struct {
 
 	round     uint64
 	nextRound protocol.ByteCount
-	bw        bwFilter // bytes/s
+	bwRound   uint64   // rounds that ended on a sample the app did not limit
+	bw        bwFilter // bytes/s, indexed by bwRound
 
 	minRTT      time.Duration
 	minRTTStamp monotime.Time
@@ -105,7 +108,7 @@ func NewBBRSender(rtt *utils.RTTStats, mss protocol.ByteCount) SendAlgorithmWith
 // pacingRate is bytes/s. Before the first sample it is the initial window
 // per smoothed RTT, times the Startup gain.
 func (b *bbrSender) pacingRate() uint64 {
-	if bw := b.bw.max(b.round); bw > 0 {
+	if bw := b.bw.max(b.bwRound); bw > 0 {
 		return uint64(b.pacingGain * float64(bw))
 	}
 	srtt := b.rtt.SmoothedRTT()
@@ -116,7 +119,7 @@ func (b *bbrSender) pacingRate() uint64 {
 }
 
 func (b *bbrSender) bdp(gain float64) protocol.ByteCount {
-	bw := b.bw.max(b.round)
+	bw := b.bw.max(b.bwRound)
 	if bw == 0 || b.minRTT == 0 {
 		return initialCongestionWindow * b.mss
 	}
@@ -158,12 +161,15 @@ func (b *bbrSender) OnPacketAcked(pn protocol.PacketNumber, _, _ protocol.ByteCo
 	if roundStart {
 		b.nextRound = b.delivered
 		b.round++
+		if !p.appLimited {
+			b.bwRound++
+		}
 	}
 	// The slower of the send and ack rates over this packet's flight.
 	if d := max(p.sent.Sub(p.firstSent), now.Sub(p.deliveredT)); d > 0 {
 		rate := uint64(float64(b.delivered-p.delivered) / d.Seconds())
-		if !p.appLimited || rate >= b.bw.max(b.round) {
-			b.bw.update(b.round, rate)
+		if !p.appLimited || rate >= b.bw.max(b.bwRound) {
+			b.bw.update(b.bwRound, rate)
 		}
 	}
 	rtt := b.rtt.LatestRTT()
@@ -172,8 +178,9 @@ func (b *bbrSender) OnPacketAcked(pn protocol.PacketNumber, _, _ protocol.ByteCo
 		b.minRTT, b.minRTTStamp = rtt, now
 	}
 
-	if roundStart && !b.full {
-		if bw := b.bw.max(b.round); bw >= b.fullBw*5/4 {
+	// Only a round the path paced can show that bandwidth stopped growing.
+	if roundStart && !b.full && !p.appLimited {
+		if bw := b.bw.max(b.bwRound); bw >= b.fullBw*5/4 {
 			b.fullBw, b.fullRounds = bw, 0
 		} else if b.fullRounds++; b.fullRounds >= 3 {
 			b.full = true

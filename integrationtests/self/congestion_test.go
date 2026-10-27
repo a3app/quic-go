@@ -148,3 +148,89 @@ func TestBBRFindsBottleneck(t *testing.T) {
 	t.Logf("bbr at 2 %% loss %v", tl)
 	require.Less(t, tl, ideal*15/10, "bbr backed off on random loss")
 }
+
+// benchPattern mimics loft-bench on one connection: the server sends size,
+// the client sends size, then the server sends size over 4 streams.
+func benchPattern(t *testing.T, a congestion.Algorithm, rtt time.Duration, b *bottleneck, size int) (down, up, down4 time.Duration) {
+	synctest.Test(t, func(t *testing.T) {
+		clientConn, serverConn, closeFn := newSimnetLinkWithRouter(t, rtt, b)
+		defer closeFn(t)
+		ln, err := quic.Listen(serverConn, getTLSConfig(), getQuicConfig(nil))
+		require.NoError(t, err)
+		defer ln.Close()
+		data := bytes.Repeat([]byte{'x'}, size)
+		sconn := make(chan *quic.Conn, 1)
+		go func() {
+			conn, err := ln.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			conn.SetCongestionControl(a)
+			sconn <- conn
+			// phase 1: one stream down
+			str, _ := conn.OpenStream()
+			str.Write(data)
+			str.Close()
+			// phase 2: read the client's upload
+			in, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				return
+			}
+			io.Copy(io.Discard, in)
+			// phase 3: four streams down
+			for i := 0; i < 4; i++ {
+				go func() {
+					s, _ := conn.OpenStream()
+					s.Write(data[:size/4])
+					s.Close()
+				}()
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+		conn, err := quic.Dial(ctx, clientConn, serverConn.LocalAddr(), getTLSClientConfig(), getQuicConfig(nil))
+		require.NoError(t, err)
+		defer conn.CloseWithError(0, "")
+		conn.SetCongestionControl(a)
+		t0 := time.Now()
+		s1, err := conn.AcceptStream(ctx)
+		require.NoError(t, err)
+		io.Copy(io.Discard, s1)
+		down = time.Since(t0)
+		t1 := time.Now()
+		o, err := conn.OpenStreamSync(ctx)
+		require.NoError(t, err)
+		o.Write(data)
+		o.Close()
+		// up ends when the server has read it all: its first phase-3 stream arrives.
+		var wg sync.WaitGroup
+		first := true
+		for i := 0; i < 4; i++ {
+			s, err := conn.AcceptStream(ctx)
+			require.NoError(t, err)
+			if first {
+				up, first = time.Since(t1), false
+				t1 = time.Now()
+			}
+			wg.Add(1)
+			go func() { defer wg.Done(); io.Copy(io.Discard, s) }()
+		}
+		wg.Wait()
+		down4 = time.Since(t1)
+		(<-sconn).CloseWithError(0, "")
+	})
+	return
+}
+
+// TestBBRAfterQuietSpell: a sender that sat app-limited (its peer was
+// uploading, or it only sent acks) must not come out of it believing the
+// trickle it saw is the path. Before the fix the second download took 17 s
+// and the upload 16 s on this 6 MB/s path.
+func TestBBRAfterQuietSpell(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		down, up, down4 := benchPattern(t, congestion.BBR(), 150*time.Millisecond, &bottleneck{rate: 6 << 20, queue: 1 << 20, loss: 0.005}, 8<<20)
+		t.Logf("down %v up %v down4 %v", down, up, down4)
+		require.Less(t, up, 4*time.Second, "upload crawled after the client only acked")
+		require.Less(t, down4, 4*time.Second, "download crawled after the server sat out the upload")
+	}
+}
